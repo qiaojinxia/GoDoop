@@ -8,8 +8,6 @@ Map 流程: 数据 通过逐行读取 到 缓冲器 到达一定 容量后 多�
 
 
 
-![image-20200215194959698](/Users/qiao/go/src/godoop/src/image-20200215194959698.png)
+![image-20200215194959698](image-20200215194959698.png)
 
-# godoop# godoop
 # godoop
-# gopig
