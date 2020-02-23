@@ -5,8 +5,18 @@ import (
 	"time"
 )
 
+//Map文件写出路径
+const MAPDIR ="/Users/qiao/go/src/godoop/src/mapdir/"
+
+
+
+
 //排序缓存策略 如果 排序的两个key大于多少大小 对结果缓存
-const SORTCACHE = 3
+const SORTCACHE = 5
+const CACECOMPAR =false //当要排序的文档中有大量重复key时可以开启
+
+
+
 
 const  SPILLCAPACITY = 20.0
 type TaskType int //任务类型 0 Map任务 1 Reduce任务
@@ -18,10 +28,19 @@ func  (kv KeyValue) ToString() string{
 	return fmt.Sprintf("%s:%s,",kv.Key,kv.Value)
 
 }
+
+
+
+//MASTERConfig
+const(
+	CONFIRMOUTTIME = 2 //秒 消息确认超时
+)
+
 const (
 	MapTask              = 0               //表示map任务
 	ReduceTask           = 1                //表示Reduce任务
 	NoneTask			 = -1
+
 	UnfinishedTask		= 2					//这个状态表明Worker 之前存在任务完成 就再次请求了
 	InitWorkNum          = 0               //默认初始 WorkerId 表示未分配WorkId
 
@@ -33,6 +52,8 @@ const (
 
 	WORKOUTTIME = 1 //Work超时时间 分钟
 	TASKTIMEOUT = 60 //TASK超时时间 秒
+
+	OWNTASKNUM = 2 //每个Worker 所能拥有的 任务数
 
 
 	//todo

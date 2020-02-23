@@ -2,6 +2,7 @@ package src
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -57,7 +58,6 @@ func (ma *Msg_Args) Sign() {
 
 
 //------------------------------
-
 
 type Msg_Reply struct {
 	Tasks    []Task         //返回给定的任务表
@@ -222,16 +222,70 @@ func (rr *Reply_Regs) Sign() {
 	rr.IsSuccess =true
 }
 
+const (
+	UNCOMPLETED = iota
+	FINISHED
+	GIVEUP
+)
+//返回给Master的信息
+type TaskPack struct{
+	TaskId   string            //任务ID
+	TaskType TaskType          //任务类型
+	PathUrl  Partition
+	Status   int               //定义任务的几种状态 0 未完成 1 完成 2 放弃
+	sign string //返回消息的签名 防止多次提交相同消息
+}
+
+//返回任务完成信息
+func NewTaskPack() *TaskPack{
+	return &TaskPack{
+		TaskId:   "",
+		TaskType: NoneTask,
+		Status:   UNCOMPLETED,
+	}
+}
+func (tp *TaskPack) SetTaskId(taskid string){
+	tp.TaskId = taskid
+}
+func (tp *TaskPack) SetTaskType(tasktype TaskType){
+	tp.TaskType = tasktype
+}
+func (tp *TaskPack) SetStatus(taskstatus int){
+	tp.Status = taskstatus
+}
+func (tp *TaskPack) SetPar(par *Partition){
+	tp.PathUrl = *par
+}
+
+func (tp *TaskPack) getSign() string{
+	buff := make([]byte,0,10)
+	for _,m:= range tp.PathUrl.Url{
+		buff = append(buff, m...)
+	}
+	buff =  append(buff, strconv.Itoa(tp.PathUrl.NReduce)...)
+	buff = append(buff,tp.TaskId ...)
+	buff =append(buff,strconv.Itoa(tp.Status)...)
+	buff =append(buff,strconv.Itoa(int(tp.TaskType))...)
+	return GetSHA256HashCode(buff)
+}
+
+//对消息进行sha256
+func (tp *TaskPack) setSign(){
+	sha256 := tp.getSign()
+	tp.sign = sha256
+}
 //-----------------------------------
 
-//定义注册 心跳包
+//定义注册 心跳包 心跳包 可以用来确认消息 和 消息完成时的 返回机制
 type Msg_Heart struct {
-	HeartId uint64 //心跳id
-	WorkId uint64 //工人id
-	Interval time.Duration //心跳间隔
-	IsValid bool		//消息是否有效
-	ConfimTaskID []string //确认收到消息
-	TimeStamp time.Duration //消息发送时间戳 消息发送超时丢弃
+	HeartId      uint64        //心跳id
+	WorkId       uint64        //工人id
+	Interval     time.Duration //心跳间隔
+	IsValid      bool          //消息是否有效
+	TaskResult   []TaskPack    //返回给Master完成的Task信息
+	TimeStamp    time.Duration //消息发送时间戳 消息发送超时丢弃
+	ConfimTaskID []string	//Worker确认收到任务
+	UrgeTask	[]string	//todo:存放一系列的任务id 这些任务将会插队优先处理
 }
 func (hp *Msg_Heart) isExpire() bool{
 	if hp.TimeStamp == 0 {
@@ -239,6 +293,21 @@ func (hp *Msg_Heart) isExpire() bool{
 	}
 	//如果 当前 时间 大于过期时间 则 过期
 	return time.Now().UnixNano() > int64(hp.TimeStamp+MSG_TIMEOUT)
+}
+func (hp *Msg_Heart) hasTaskInfo() bool{
+	if len(hp.ConfimTaskID) !=  0 && hp.IsValid {
+		return true
+
+	}
+	return false
+}
+
+func (hp *Msg_Heart) hasTaskFinished() bool{
+	if len(hp.TaskResult) !=  0 && hp.IsValid{
+		return true
+
+	}
+	return false
 }
 
 //定义心跳 注册 包 初始化
@@ -252,10 +321,17 @@ func NewHeart_Pack(id uint64,heartid uint64,interval time.Duration) Msg_Heart {
 		TimeStamp:time.Duration(time.Now().UnixNano()),
 	}
 }
-//向Master 确认 任务已收到
+
+//绑定消息 到 心跳上
+func (mh *Msg_Heart)TaskedDeliver(taskpack TaskPack){
+	mh.TaskResult = append(mh.TaskResult,taskpack)
+}
+
+//向Master 确认 任务已收到 Master 给任务 Worker 收到任务 确认
 func (mh *Msg_Heart) LoadConfimTask(tasks *[]string){
 	mh.ConfimTaskID = *tasks
 }
+
 
 //对要发送的数据进行处理
 func (mh *Msg_Heart) Sign() {
@@ -267,10 +343,13 @@ func (mh *Msg_Heart) Sign() {
 
 //心跳信息
 type Reply_Heart struct {
-	WorkId uint64 //工人id
-	Isccess bool
-	IsValid bool
-	TimeStamp time.Duration //消息发送时间戳 消息发送超时丢弃
+	WorkId     uint64 //工人id
+	Isccess    bool
+	IsValid    bool
+	TimeStamp  time.Duration //消息发送时间戳 消息发送超时丢弃
+	AckConfirm []string      //返回给Worker确认收到消息
+	AckFinished []string      //返回给Worker确认完成消息
+
 }
 //初始化 存放返回消息
 func NewHeart_Reply(id uint64) *Reply_Heart {
@@ -281,6 +360,11 @@ func NewHeart_Reply(id uint64) *Reply_Heart {
 	}
 }
 
+
+//Master确认消息
+func (mh *Msg_Heart) Master_Confirm(info []string){
+	mh.ConfimTaskID = info
+}
 
 func (hr *Reply_Heart) isExpire() bool{
 	if hr.TimeStamp == 0 {

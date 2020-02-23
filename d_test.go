@@ -14,7 +14,7 @@ import (
  */
 
 func Test_sort(t *testing.T){
-	file ,err:= os.Open("/Users/qiao/go/src/godoop/src/pg-metamorphosis.txt")
+	file ,err:= os.Open("/Users/qiao/go/src/godoop/pg-metamorphosis.txt")
 	if err != nil{
 		panic(err)
 	}
@@ -30,7 +30,7 @@ func Test_sort(t *testing.T){
 		}
 		kv := Map("metamorphosis", string(line))
 		for _,m := range kv{
-			a.collect(m)
+			a.Collect(m)
 		}
 
 	}

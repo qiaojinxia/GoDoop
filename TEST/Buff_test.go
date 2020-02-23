@@ -84,10 +84,7 @@ func Test_metadataGet(t *testing.T){
 	resval := make([]string,0)
 	for i,_:= range a.metaint.metapoint{
 		xv := &a.metaint.metapoint[i]
-		d,err := (*xv).getkey(&a.kvbuffer)
-		if err != nil{
-			panic(err)
-		}
+		d := (*xv).getkey(&a.kvbuffer)
 		resval = append(resval,string(d) )
 	}
 	num := 0
@@ -117,17 +114,13 @@ func Test_ringGet(t *testing.T){
 func Test_ringbuf(t *testing.T) {
 	a := callbefore()
 	fmt.Println(a.metaint.getlen())
-	c,err :=a.metaint.get(0)
-	if err != nil{
-		panic(err)
-	}
+	c, _ :=a.metaint.get(0)
+
 
 	//for _,m:= range a.metaint.metapoint{
 	//	c,_ :=m.BytesToInt()
-	d,err := c.BytesToInt()
-	if err != nil{
-		panic(err)
-	}
+	d:= c.BytesToInt()
+
 	src.formmat(d)
 	//}
 }
@@ -390,15 +383,17 @@ func Test_getamountt( *testing.T) {
 }
 
 //读取外部数据文件 排序
-func Test_sort(t *testing.T) {
+func Test_sort1(t *testing.T) {
 
-	file ,err:= os.Open("/Users/qiao/go/src/godoop/src/pg-metamorphosis.txt")
+	file ,err:= os.Open("/Users/qiao/go/src/godoop/pg-metamorphosis.txt")
 	if err != nil{
 		panic(err)
 	}
 	count := 0
 	defer file.Close()
 	a := src.NewCacheBuf(10,1024 *1024 * 100)
+	sh := src.NewStoreHandler(10,"xxx")
+	a.SetStoreHandler(sh)
 	a.SetCacheBuffWriteFunc(src.DefaultWirteOutBuff)
 	rf := bufio.NewReader(file)
 	for{
@@ -408,7 +403,7 @@ func Test_sort(t *testing.T) {
 		}
 		kv := src.Map("metamorphosis", string(line))
 		for _,m := range kv{
-		a.collect(m)
+		a.Collect(m)
 		}
 
 	}

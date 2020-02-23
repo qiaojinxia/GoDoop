@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const OUTPUTFILENAME = "map-spill-out-%d"
+const OUTPUTFILENAME = MAPDIR + "map-spill-out-%s-%d"
 
 
 type outInfo struct {
@@ -131,14 +131,18 @@ type storeHandler struct {
 	keys 	[]*[]string
 	url 	[]string //保存文件的目录
 	filename string
+	taskname  string
+	successwrite bool //成功写出
 }
-func NewStoreHandler(nReduce uint32) *storeHandler {
+func NewStoreHandler(nReduce uint32,taskname string) *storeHandler {
 	return &storeHandler{
 		nReduce: nReduce,
 		num:     0,
 		fileout: make(map[string]*kvContent, 0),
 		keys:    make([]*[]string, nReduce,nReduce),
-		filename:fmt.Sprintf(OUTPUTFILENAME,0),
+		filename:fmt.Sprintf(OUTPUTFILENAME,taskname,0),
+		taskname:taskname,
+		successwrite:false,
 	}
 }
 func (sh *storeHandler)	isExists(par uint32,key string) bool{
@@ -205,19 +209,22 @@ func (sh *storeHandler) WriteOutBuff(){
 	sh.url= append(sh.url, sh.filename)
 	Info.Printf("写出花费时间 %d 毫秒 ",time.Now().Sub(bg).Milliseconds())
 	sh.num ++
-	sh.filename = fmt.Sprintf(OUTPUTFILENAME,sh.num)
+	sh.filename = fmt.Sprintf(OUTPUTFILENAME,sh.taskname,sh.num)
+
 }
 
 //将多个溢出 排序后合并
 func (sh *storeHandler) MergeFile(){
 	sh.lock.Lock()
+	tmpurl := make([]string,0)
 	keyslen := 0
 	for _,v := range sh.keys{
 		keyslen += len(*v)
 	}
 	fmt.Println("keynums",keyslen)
 	for i:=0;i < len(sh.keys);i++{
-		pathx := fmt.Sprintf("map-out-%d",i)
+		pathx := fmt.Sprintf(MAPDIR + "map-out-%s-%d",sh.taskname,i)
+		tmpurl = append(tmpurl, pathx)
 		i2 := *sh.keys[uint32(i)]
 		for m:=0;m<len(i2);m++{
 			//count := 0
@@ -230,7 +237,6 @@ func (sh *storeHandler) MergeFile(){
 				if len(ab) != 8  {
 					continue
 				}
-
 				start := BytesToUint32(ab[:4])  + a.offset
 				end := BytesToUint32(ab[4:]) + a.offset
 				counter := 0
@@ -261,5 +267,12 @@ func (sh *storeHandler) MergeFile(){
 			fmt.Println("can't find path error!")
 		}
 	}
+	url := make([]string,0)
+	for _,p := range tmpurl{
+		url = append(url,p)
+	}
+	sh.url = url
+	//成功写出
+	sh.successwrite = true
 	sh.lock.Unlock()
 }

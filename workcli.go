@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log"
 	"net/rpc"
@@ -41,17 +40,16 @@ type WorkerCli struct {
 	heartNexttime time.Duration //下次发送心跳时间
 	heartCount uint64           //心跳次数
 	tryouttime int              //超时重试次数
-	alive chan bool             //节点是否在线
+	alive chan bool             //决定着 Worker是否罢工
 	workdata *WorkInfo          //记录worker信息
-	confirmTask []string        //如果Worker 收到了这个 任务就会添加到列表  通过心跳返回给Master 这样Master 就会确认你收到了
+	workFinished chan TaskPack	//存放完成的任务 需要通过心跳返还给Master
+	confirmTask []string        //如果Worker 收到了这个 任务就会添加到列表  通过心跳返回给Master 这样Master 就会确认你收到了 模仿tcp/ip的三次握手
+	isConfirm []string        //如果Worker 收到了这个 任务就会添加到列表  通过心跳返回给Master 这样Master 就会确认你收到了 模仿tcp/ip的三次握手
 	rb *CacheBuf                //缓冲读取数据 排序 写出
+	nReduce	uint32			//划分任务数
+	hearflg		bool	//心跳标志位
 
-}
 
-func ihash(key string) uint32 {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return h.Sum32() & 0x7fffffff
 }
 
 //初始化 Worker客户端
@@ -68,71 +66,137 @@ func NewWorkerCli(nReduce uint32,mapf func(string, string) []KeyValue,reducef fu
 		heartNexttime: time.Duration(time.Now().UnixNano()),
 		alive:         make(chan bool,1),
 		rb:            NewCacheBuf(nReduce ,1024 * 1024 *10),
+		workFinished:make(chan TaskPack,24),
+		isConfirm:make([]string,0,10),
+		nReduce:nReduce,
+		hearflg:false,
 	}
 	a.alive <- false//初始默认节点处于离线状态
 	//设置写出的处理函数
 	a.rb.SetCacheBuffWriteFunc(DefaultWirteOutBuff)
 	return a
 }
-//获取任务
-func (wc *WorkerCli) Working(){
-	for{
+
+
+//主动获取任务
+func (wc *WorkerCli) Working() error{
 		isalive := wc.isalive()
 		if isalive == false{
-			fmt.Println("Work Now Is Offline Waiting To Register!")
-			return
+			Info.Println("Work Now Is Offline Waiting To Register!")
+			return errors.New("Work Offline")
 		}
-		fmt.Printf("Worker Id %d Will Request Get Tak!",wc.WorkID)
+		Info.Printf("Worker Id %d Will Request Get Tak!\n",wc.WorkID)
 		//初始化消息参数
 		reply := NewMsg_Reply(wc.WorkID)
 		args := NewMsg_Args(wc.WorkID, MapTask)
 		//调用用获取任务
 		args.Sign()
 		wc.call(RPC_TASKDISTRIBUTION,args,reply)
-		fmt.Print("【Info】Master Return Info:",reply.Message)
+		Info.Print("Master Return Info:",reply.Message)
 		//存在之前没完成的任务
 		if reply.TaskType == UnfinishedTask {
+			Info.Printf("Waiting to finished my work first!")
 			//todo 要么放弃 要么存储重新提交
-			return
+			finished := 0
+			for _,v := range wc.TaskTable{
+				//未提交 且 未过期的任务
+				if v.Status != TASKTYPE_COMMITED && !v.Expired(){
+					finished += 1
+				}
+			}
+			return errors.New(fmt.Sprintf("Task Beyond what you have not finished %d Max you can own %d\n",finished,OWNTASKNUM))
 		}
 		if !reply.Verify(){
-			return
+			return errors.New("Reply Message Invalid!")
 		}
+		wc.hearflg = false
 		//将受到的确认 收到消息放回到列表 用于心跳时传回
 		for _,m := range reply.Tasks{
 			wc.confirmTask = append(wc.confirmTask, m.TaskId)
 		}
-		wc.confirmTask= append(wc.confirmTask, )
+		retrytimes :=0
+		for !wc.hearflg {
+			retrytimes +=1
+			//等待信条
+			Info.Printf("Has %d Task Waiting to Heart Confirm!",len(wc.confirmTask))
+			time.Sleep(time.Second * 1)
+			//超过20秒 放弃这次Worker请求的内容
+			if retrytimes > 20{
+				return errors.New("Confirm Retrytimes Outtimes !")
+			}
+		}
+		//将收到的任务放进Task表中 去除没有确认的
+		for _,tsk := range reply.Tasks{
+			Info.Printf("ADD Task %s To  TaskList !",tsk.TaskId)
+			if Contains(wc.isConfirm,tsk.TaskId) {
+				//如果确认任务 设置为处理中
+				up := tsk.UpdataTaskStaus(TASKTYPE_PROCESS,true)
+				if up == false{
+					panic("status error")
+				}
+			}else{
+				//未完成
+				tsk.UpdataTaskStaus(TASKTYPE_UNCONFIRM,true)
+			}
+			//如果task表没有初始化
+			if len(wc.TaskTable) == 0 {
+				wc.TaskTable =  make(map[string]Task,0)
+			}
+			wc.TaskTable[tsk.TaskId] = tsk
+		}
 		//遍历收到的所有Task
 		for i:=0;i< len(reply.Tasks);i++ {
+			//初始化写出的方法
+			sh := NewStoreHandler(wc.nReduce,reply.Tasks[i].TaskId)
+			wc.rb.SetStoreHandler(sh)
 			switch reply.Tasks[i].TaskTYpe {
 			case MapTask:
+				tmptable := wc.TaskTable[reply.Tasks[i].TaskId]
 				wc.doMapTask(args,reply,i)
+				//如果写出成功 bingqie url表大于0
+				if sh.successwrite && len(sh.url) > 0{
+					up := tmptable.UpdataTaskStaus(TASKTYPE_Finished,true)
+					if up == false{
+						panic("error")
+					}
+					//将文件路径  放到url
+					var urls []string
+					if len(tmptable.Partition.Url[i]) <len(sh.url){
+						urls = make([]string,len(sh.url))
+					}else{
+						urls = tmptable.Partition.Url
+					}
+					for i,v := range sh.url{
+						//将写出处理器里面的 数据保存到 任务表里面 另一个协程将会 负责回传消息给Master
+						urls[i] = v
+					}
+					//设置返回任务完成的消息
+					tmptable.Partition.Url= urls
+					wc.TaskTable[reply.Tasks[i].TaskId] = tmptable
+				}
 			case ReduceTask:
 				wc.doReduceTask(args,reply,i)
 			default:
-				fmt.Println("error!")
+				return errors.New("Unkown error!")
 			}
 		}
-
-		//任务完成 传送到 文件系统 todo
-
-		//同时master 任务已经完成 通过心跳
-
-
-
-	}
+	return nil
 }
 func (wc *WorkerCli) doMapTask(args Msg_Args,reply *Msg_Reply,taskid int){
 	//根据任务数初始化管道数目
 	go wc.ReadFile(reply,taskid)
-	fmt.Println("Prepare complete  task will run....")
-		//携程处理文件读写
-	go wc.CoreHandler()
+	Info.Println("Prepare complete  TaskResult will run....")
+	//携程处理文件读写
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go wc.CoreHandler(&wg)
+	//等待处理完毕
+	wg.Wait()
+
 }
 
-func(wc *WorkerCli) CoreHandler(){
-	fmt.Println("Start Read from chan")
+func(wc *WorkerCli) CoreHandler(wg *sync.WaitGroup){
+	Info.Println("Start Read from chan")
 	//初始化ringbuff
 	for{
 		select{
@@ -140,7 +204,7 @@ func(wc *WorkerCli) CoreHandler(){
 				entry := wc.mapf("xx", string(data))
 				for _,v := range entry{
 					//写入环形缓冲区
-					wc.rb.collect(v)
+					wc.rb.Collect(v)
 				}
 			//判断有没有读取完成
 			default:
@@ -157,11 +221,12 @@ func(wc *WorkerCli) CoreHandler(){
 		}
 	}
 	end:
-	fmt.Println("task finished!")
+	wg.Done()
+	Info.Println("TaskResult finished!")
 }
 
 func (wc *WorkerCli) doReduceTask(args Msg_Args,reply *Msg_Reply,taskid int){
-
+	
 
 }
 
@@ -186,9 +251,8 @@ func (wc *WorkerCli) ReadFile(reply *Msg_Reply,taskid int)  {
 			}
 		}
 	}
-	fmt.Println("读文件锁!")
 	wc.isFinished <- true
-	fmt.Println("文件读取完毕!")
+	Info.Println("File Reading Finished!")
 }
 
 //发送心跳
@@ -198,16 +262,41 @@ func (wc *WorkerCli) StartHeart(){
 		//只有在有Workerid的情况下才能开始心跳
 		if wc.WorkID != InitWorkNum {
 			if time.Now().UnixNano() - int64(wc.heartNexttime) > 0 {
-				fmt.Println("【info】Send New Heart!")
 				//如果 确认任务表 里有任务则 通过心跳发送
 				args := NewHeart_Pack(wc.WorkID,wc.heartCount,wc.heartInterval)
 				reply := NewHeart_Reply(wc.WorkID)
+				wc.heartCount ++
 				//如果消息确认列表里有待注册的消息那么就附加
 				if len(wc.confirmTask) >0{
+					Info.Printf("Found %d Confirm Msg Waiting to Send!",len(wc.confirmTask))
 					args.LoadConfimTask(&wc.confirmTask)
 				}
+				//这里消费 已完成的任务
+				if len(wc.workFinished) > 0 {
+					for  {
+						select{
+							case respack:=<-wc.workFinished:
+								//设置为 未提交状态
+								t := wc.TaskTable[respack.TaskId]
+								up := t.UpdataTaskStaus(TASKTYPE_COMMITED,true)
+								if up == false{
+									continue
+								}
+								//将 的任务的消息取出 发送给Master
+								Info.Printf("Task %s Url %v  TaskType %d TaskStatus %d Message Will Send To Master!",respack.TaskId,respack.PathUrl,respack.TaskType,respack.Status)
+								wc.TaskTable[respack.TaskId] = t
+								args.TaskResult = append(args.TaskResult, respack)
+						default:
+							//消费完收工
+							goto endselect
+						}
+
+					}
+				}
+				endselect:
 				nexttime := time.Now().UnixNano()//记录发送时的时间
-				fmt.Printf("【Info %s】 :Will Send Heart \n",time.Now().String())
+				Info.Printf("MyWorkId:%d Will Send  %d Times Hearts Waiting To ConfirmTaskId" +
+					" Is :%v Have %d Task Finished !\n",args.WorkId,args.HeartId,args.ConfimTaskID,len(args.TaskResult))
 				args.Sign()
 				wc.call(RPC_HEARTMESSAGE,args,reply)
 				if len(wc.alive) == 0{
@@ -215,7 +304,23 @@ func (wc *WorkerCli) StartHeart(){
 					wc.alive <- false //如果特殊情况 chan 里没值 会触发 阻塞 这里做处理
 				}
 				if reply.Isccess{
+					//将收到的消息 加入确认列表
+					wc.isConfirm = append(wc.isConfirm, reply.AckConfirm...)
+					//清除 确认任务表
+					wc.confirmTask = wc.confirmTask[:0]
+					wc.hearflg = true
 					wc.heartNexttime = time.Duration(nexttime + int64(wc.heartInterval))//计算下一次发送的时间
+					//如果 确认Master收到了这条消息
+					if reply.AckFinished != nil{
+						for _,v:= range reply.AckFinished{
+							t := wc.TaskTable[v]
+							up :=t.UpdataTaskStaus(TASKTYPE_END,true)
+							if up == false{
+								continue
+							}
+							wc.TaskTable[v] = t
+						}
+					}
 					wc.setalive(true)
 					time.Sleep(wc.heartInterval - time.Second - 1 )//间隔前1秒唤醒心跳 可调整
 				}else{
@@ -284,19 +389,19 @@ func (wc *WorkerCli ) setalive(alive bool){
 			if alive == true{
 				state ="Online"
 			}
-			fmt.Printf("Present Work State %s will Update to Online",state)
+			Info.Printf("Present Work State %s will Update to Online",state)
 		}else{
 			tmp :=<- wc.alive
 			if alive == true{
 				tmp = tmp//无意义
 				state ="Online"
 			}
-			fmt.Printf("Present Work State %s will Update to Online",state)
+			Info.Printf("Present Work State %s will Update to Online",state)
 
 			wc.alive <- alive
 		}
 	}else{
-		fmt.Println("Now Work State  is online Keeping....")
+		Info.Println("Now Work State  is online Keeping....")
 	}
 }
 
@@ -304,10 +409,18 @@ func(wc *WorkerCli) CliStart() {
 	//注册Worker
 	wc.RegisterWorker()
 	if wc.isalive() {
+		//后台扫描 完成的任务
+		go wc.selectFinished()
 		//启动心跳
 		go wc.StartHeart()
 	if wc.workdata.Strategy == DEFAULTSTARGEGY {
-		go wc.Working()
+		for{
+			err := wc.Working()
+			time.Sleep(time.Second * 1)
+			if err!= nil{
+				Error.Println(err)
+			}
+		}
 	}
 	}else{
 		fmt.Println("work reg fail!")
@@ -329,5 +442,39 @@ func(wc *WorkerCli) call(rpcname string, args interface{}, reply interface{}) bo
 	}
 	fmt.Println(err)
 	return false
+}
+
+//处理完成的任务
+func (wc *WorkerCli) selectFinished() {
+	for{
+		//休眠2秒
+		time.Sleep(time.Second * 2)
+		if len(wc.workFinished) == 0{
+			wc.workFinished = make(chan TaskPack,10)
+		}
+		//循环遍历任务 查找已经完成的任务
+		for _,m := range wc.TaskTable {
+			if m.Status == TASKTYPE_Finished && !m.Expired()  {
+				tp := NewTaskPack()
+				tp.SetPar(m.Partition)
+				tp.SetStatus(FINISHED)
+				tp.SetTaskId(m.TaskId)
+				tp.SetTaskType(m.TaskTYpe)
+				//对消息进行sha256
+				tp.setSign()
+				//把完成的任务丢进管道
+				wc.workFinished <- *tp
+			//没有完成 没有过期的
+			}else if m.Status == TASKTYPE_PROCESS && !m.Expired(){
+				Info.Printf(" Task %s Wating to finished Task !",m.TaskId)
+			//没有完成  已经过期的
+			}else if  m.Status == TASKTYPE_PROCESS && m.Expired(){
+				Info.Printf(" Task %s is Expired!",m.TaskId)
+			}
+
+		}
+
+	}
+
 }
 

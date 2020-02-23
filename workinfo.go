@@ -18,7 +18,7 @@ type WorkInfo struct {
 	Ip string
 	//端口号
 	Port int
-	//主机cpu
+	//	//主机cpu
 	CpuInfo string
 	//todo 采用主动式获取任务调用接口获取任务 或者被动式分配任务  0 1
 	Strategy int
@@ -34,6 +34,8 @@ type WorkInfo struct {
 	Outtime time.Duration
 	//Worker拥有的任务
 	Task map[string]Task
+	//Worker完成的任务
+	FinishedTask map[string]Task
 	//上次在线时间
 	TimeStamp time.Duration
 }

@@ -37,38 +37,71 @@ func (mb metadata) getkey(kvbuffer *[]byte) []byte{
 	part1 = append(part1, (*kvbuffer)[0:d[1]+1]...)
 	return part1
 }
-
-func (mb metadata) compar(cache map[string]map[string]int,kvbuffer *[]byte,str1 []byte) int {
-	d:=mb.getkey(kvbuffer)
-	st1 := string(d)
-	st2 := string(str1)
-	//大于3个字符开启缓存
-	if len(st1) >=SORTCACHE && len(st2) >= SORTCACHE{
-		m1 ,ok := cache[st1]
-		if ok {
-			m2 ,ok1 := m1[st2]
-			if ok1{
-				//Info.Printf("命中缓存 k1:%s (%d) k2:%s",st1,m2,st2)
-				return m2
-			}else{
-				goto bk
+func (mb metadata) comparraw(kvbuffer *[]byte,org *metadata) int {
+	var len1,len2,start1,start2 uint32
+	kvlen := uint32(len(*kvbuffer))
+	start1 = BytesToUint32(mb[:4])
+	end := BytesToUint32(mb[4:8])
+	if start1  <= end{
+		len1 = end - start1 + 1
+	}else{
+		len1 = kvlen - start1 + end + 1
+	}
+	start2 = BytesToUint32((*org)[:4])
+	end = BytesToUint32((*org)[4:8])
+	if start2  <= end{
+		len2 = end - start2 + 1
+	}else{
+		len2 = kvlen - start2 + end + 1
+	}
+	//k1 := string(mb.getkey(kvbuffer))
+	//k2 := string(org.getkey(kvbuffer))
+	//ca := CompareString(&k1,&k2)
+	//if len(k1) != int(len1) || len(k2) != int(len2){
+	//	fmt.Printf("key1 : %s len1 %d  key2 %s len2 %d \n",k1,len1,k2,len2)
+	//	panic("error")
+	//}
+	if len1 > len2 {
+		//if ca != 1{
+		//	panic("error")
+		//}
+		return 1
+	}else if len1 < len2{
+		//if ca != -1{
+		//	panic("error")
+		//}
+		return -1
+	}else if len1 == len2{
+		var str1,str2 byte
+		for i:=0;i<int(len1);i++{
+			str1 = (*kvbuffer)[(int(start1) + i) % int(kvlen)]
+			str2 = (*kvbuffer)[(int(start2) + i) % int(kvlen)]
+			//if str1 !=  k1[i] || str2 != k2[i]{
+			//	fmt.Printf("str1 %d  k1[i] %d str2 %d k2[i] %d   ",str1,k1[i],str2,k2[i])
+			//	panic("xxxxxx")
+			//}
+			if str1 > str2{
+				//if ca != 1{
+				//	fmt.Printf("key1 : %s str1 %s  key2 %s str2 %s  \n",k1,string(str1),k2,string(str2))
+				//	panic("error")
+				//}
+				return 1
+			}else if str1 < str2{
+				//if ca != -1{
+				//	fmt.Printf("key1 : %s str1 %s  key2 %s str2 %s  \n",k1,string(str1),k2,string(str2))
+				//	panic("error")
+				//}
+				return -1
+			}else if str1 == str2 {
+				if i == int(len1) -1 {
+					break
+				}
+				continue
 			}
-		}else{
-			goto bk
 		}
 	}
-	bk:
-	res := CompareString(&st1,&st2)
-	//缓存结果
-	if len(d) >=SORTCACHE && len(str1) >= SORTCACHE{
-		m2 := make(map[string]int)
-		m2 [string(str1)] = res
-		cache[string(d)] = m2
-	}
-	return res
-
+	return 0
 }
-
 func (mb metadata) getKV(kvbuffer *[]byte) ([]byte,uint32,int){
 	d := mb.BytesToInt()
 	//fmt.Println("keystart",d[0],"keyend",d[1]+d[3]+1)
@@ -95,21 +128,18 @@ type MetaInt struct {
 	kvbuffer *[]byte //指向buffer
 	metastart *int //元数据开始
 	metaend *int //元数据结尾
-	metapoint []*metadata //记录指向每个metadata的指针
+	metapoint [] metadata //记录指向每个metadata的指针
 	metamark int//记录移动数据
 	isexchange chan bool //扇区转换那一刻用于阻塞
-	metachan *[]chan *metadata
+	metachan []chan metadata
 }
-func (md *MetaInt) inital(){
+func (md *MetaInt) initalMeta(){
 	count := md.getlen()
-	p :=make([]*metadata,0)
+	p :=make([]metadata,0,count)
 	for i := 0 ;i<count; i++  {
-		m,err := md.get(i)
-		if err != nil{
-			panic(err)
-		}
+
 		//记录指针
-		p = append(p,&m)
+		p = append(p,md.get(i))
 	}
 	md.metapoint = p
 }
@@ -124,23 +154,21 @@ func (md *MetaInt) getlen() int{
 	return (*md.metastart - *md.metaend  + 1 ) / METASIZE //计算环形区的数组长度
 }
 //从最后一个索引开始取元数据区信息
-func (md *MetaInt) getInverse(num int)  (metadata,error){
+func (md *MetaInt) getInverse(num int)  metadata{
 	metalen := md.getlen() -1
 	if num > metalen {
-		return nil,errors.New("Out Of Bufferbyte")
+		return nil
 	}
-	metadata,err := md.get(metalen - num )
-	return metadata,err
+	metadata := md.get(metalen - num )
+	return metadata
 
 }
 //给定索引取元数据区的内容 从 kvstart 开始取 每次 减去 16 个字节
-func (md *MetaInt) get(num int) (metadata,error){
-	res := make([]byte,0)
-	var tmp []byte
-	tmp = *md.kvbuffer
+func (md *MetaInt) get(num int) metadata{
+	res := make([]byte,0,METASIZE)
 	//超出数组数组长度报错
 	if num > md.getlen() -1{
-		return nil,errors.New("Out Of Bufferbyte")
+		return nil
 	}
 	buflen := len(*md.kvbuffer) -1
 	offeset := *md.metastart - (num + 1) * METASIZE //计算偏移 从零索引开始
@@ -149,19 +177,19 @@ func (md *MetaInt) get(num int) (metadata,error){
 		offeset = buflen - ((- offeset) % buflen) + 1
 	}else {
 		offeset+=1
-		res = append(res,tmp[offeset:offeset+METASIZE]...)
-		return res,nil
+		res = append(res,(*md.kvbuffer)[offeset:offeset+METASIZE]...)
+		return res
 	}
 	indexend :=  offeset + METASIZE -1 //如果索引 + 16 个字节 超出数组尾部 则 到环首处理
 	//如果索引 是 1022 数组总长 1023 那么 1022:1023 会有 14 个剩余
 	// 字节 在 0:13 处理 一半索引落在环尾部 一半落在 环首情况
 	if indexend > buflen{
 		partinde := buflen - offeset + 1
-		res = append(res, tmp[offeset:buflen+1]...)
-		res = append(res,tmp[0: METASIZE  - partinde ]...)
-		return res,nil
+		res = append(res, (*md.kvbuffer)[offeset:buflen+1]...)
+		res = append(res,(*md.kvbuffer)[0: METASIZE  - partinde ]...)
+		return res
 	}
-	return tmp[offeset:indexend+1], nil
+	return (*md.kvbuffer)[offeset:indexend+1]
 }
 
 func NewMetaInt(kvbuffer *[]byte,kvstart *int,kvend *int) *MetaInt{
@@ -192,6 +220,16 @@ func IntToBytes(n int) []byte{
 }
 //字节转换成整形
 func(md metadata) BytesToInt() []int {
+	x := make([]int,0,4)
+	for i:=0;i<4;i++{
+		x = append(x,int(BytesToUint32(md[:4])))
+		md = md[4:]
+	}
+	return x
+}
+
+//字节转换成整形
+func(md metadata) getkeyloc () []int {
 	x := make([]int,0,4)
 	for i:=0;i<4;i++{
 		x = append(x,int(BytesToUint32(md[:4])))
@@ -254,9 +292,8 @@ type CacheBuf struct {
 	strbuff * bytes.Buffer
 	//写出文件次数
 	spilloutime int
-
-	//排序缓存
-	sortcache [] map[string]map[string]int
+	//任务名
+	taskname string
 
 }
 
@@ -286,24 +323,20 @@ func NewCacheBuf(nReduce uint32,size int) *CacheBuf {
 		parnum:               nReduce,
 		RingBuffWriteHandler: nil,
 		spillid:              0,
-		sh:                   NewStoreHandler(nReduce),
+		sh:                   nil,
 		spilloutdeadlock:     0,
 		tag:                  make(chan bool,1),
 	}
 
 	rb.metaint = NewMetaInt(&rb.kvbuffer,&rb.kvstart,&rb.kvend)
-	metd := make([]chan *metadata,rb.parnum)
+	metd := make([]chan metadata,rb.parnum)
 	for i:=0;i<int(nReduce);i++{
-		metd[i] = make(chan *metadata,1024)
+		metd[i] = make(chan metadata,1024)
 	}
-	rb.sortcache = make([]map[string]map[string]int,nReduce)
-	for i:=0;i<int(nReduce);i++{
-		sortcache := make(map[string]map[string]int,0)
-		rb.sortcache[i] =sortcache
-	}
+
 	rb.tag <- false
 	rb.strbuff = &bytes.Buffer{}
-	rb.metaint.metachan = &metd
+	rb.metaint.metachan = metd
 	rb.spilloutime =0
 	return rb
 }
@@ -339,7 +372,7 @@ func(rb *CacheBuf) SpillAll(){
 	rb.spilloutdeadlock += 1
 	rb.wg3.Wait()
 	rb.metaint.metamark = rb.metaint.getlen()
-	rb.metaint.inital()
+	rb.metaint.initalMeta()
 	rb.wg3.Add(1)
 	rb.spilloutdeadlock -= 1
 	Info.Println("Spill All the content!")
@@ -351,14 +384,13 @@ func(rb *CacheBuf) SpillAll(){
 	rb.wg2.Wait()
 	////开一个携程 进行检测 排序内容是否全部输出完
 	go singlemonitor(&rb.wg,&rb.chokesignal, int(rb.parnum))
-	for  i:=0;i < len(*rb.metaint.metachan);i++ {
+	for  i:=0;i < len(rb.metaint.metachan);i++ {
 		rb.wg2.Add(1)
 		go rb.WriteOutChan(i)
 	}
 	rb.wg2.Wait()
 	Info.Println("写出全部!")
 	rb.RingBuffWriteHandler(rb.sh,WRITEOUTBUFF,0,nil)
-	//
 	rb.RingBuffWriteHandler(rb.sh,MERGEFILE,0,nil)
 	rb.setTag(false)
 	rb.ClearBuff()
@@ -378,6 +410,11 @@ func (rb *CacheBuf) ClearBuff (){
 
 
 }
+
+func(rb *CacheBuf) SetStoreHandler(sh *storeHandler){
+	rb.sh = sh
+}
+
 func(rb *CacheBuf) setTag(tag bool){
 	if len(rb.tag) > 0 {
 		<- rb.tag
@@ -393,7 +430,7 @@ func(rb *CacheBuf) getTag() bool{
 	return false
 }
 
-func (rb *CacheBuf) collect(kv KeyValue){
+func (rb *CacheBuf) Collect(kv KeyValue){
 	rb.lock3.Lock()
 	keyend := rb.bufindex+ len(kv.Key) -1 //键的结束地址
 	vallen := len(kv.Value) + 2
@@ -405,7 +442,6 @@ func (rb *CacheBuf) collect(kv KeyValue){
 		appendToFile("map-out-ov",kvstr)
 		rb.spillid ++
 	}
-
 
 	space ,_ := rb.surplusSpace()
 	//容量不足
@@ -419,7 +455,7 @@ func (rb *CacheBuf) collect(kv KeyValue){
 			rb.bufmark = rb.bufstart
 			//触发写出
 			rb.metaint.metamark = rb.metaint.getlen()
-			rb.metaint.inital()
+			rb.metaint.initalMeta()
 			Info.Println("[Info]Start recycling with less than 20% of the remaining capacity")
 			rb.wg.Wait()
 			rb.wg2.Wait()
@@ -462,7 +498,7 @@ func (rb *CacheBuf) collect(kv KeyValue){
 func (rb *CacheBuf) WriteOutChan(threadi int) {
 	//defer Info.Printf("[DEBUG]线程 %d 退出!\n",threadi)
 	defer rb.wg2.Done()//等价于 wg.Add(-1)
-	cd := (*rb.metaint.metachan)[threadi]
+	cd := (rb.metaint.metachan)[threadi]
 	ckvlen:= 0
 	begin:
 		for{
@@ -481,7 +517,7 @@ func (rb *CacheBuf) WriteOutChan(threadi int) {
 			default:
 				//fmt.Printf("[DEBUG]线程 %d 运行中!\n",threadi)
 				if len(cd) == 0  {
-					time.Sleep(time.Microsecond * 20)
+					time.Sleep(time.Microsecond * 1)
 					if len(cd) == 0 {
 						select{
 						case isfinished := <- rb.chokesignal:
@@ -539,15 +575,15 @@ func (rb *CacheBuf) SplliOut(){
 	rb.wg2.Wait()
 	//开一个携程 进行检测 排序内容是否全部输出完
 	go singlemonitor(&rb.wg,&rb.chokesignal, int(rb.parnum))
-	for  i:=0;i < len(*rb.metaint.metachan);i++ {
+	for  i:=0;i < len(rb.metaint.metachan);i++ {
 		rb.wg2.Add(1)
 		go rb.WriteOutChan(i)
 	}
 	Info.Println("waiting spillout!")
 	rb.wg.Wait()
 	rb.wg2.Wait()
-	for i:=0;i<len(*rb.metaint.metachan);i++{
-		if len((*rb.metaint.metachan)[i])>0{
+	for i:=0;i<len(rb.metaint.metachan);i++{
+		if len((rb.metaint.metachan)[i])>0{
 			panic("err")
 		}
 	}
@@ -566,13 +602,13 @@ func (rb *CacheBuf) SplliOut(){
 	Info.Println("[Info] Start Rinbuff Recycle!")
 	Info.Println("Older Between New MetaInt Gap:",rb.metaint.getlen() - rb.metaint.metamark)
 	if rb.metaint.getlen() - rb.metaint.metamark > 0 {
-		rb.metaint.inital()
+		rb.metaint.initalMeta()
 		tmpkvend = tmpkvend - METASIZE + 1
 		for i := 0;i< rb.metaint.getlen() - rb.metaint.metamark ;i++ {
-			md, err := rb.metaint.getInverse(i)
-			if err != nil{
+			md:= rb.metaint.getInverse(i)
+			if md == nil{
 				Info.Println("Get MeatInt Error!")
-				panic(err)
+				panic("Get MeatInt Error!")
 			}
 			//rs,_ := md.getkey(&rb.kvbuffer)
 			//fmt.Println("gc will relocalKey:",string(rs))
@@ -626,27 +662,28 @@ func (rb *CacheBuf) SplliOut(){
 
 //对元数据区进行排序
 func (rb *CacheBuf) sortMetaData()  {
-	bufchan := *rb.metaint.metachan
-	var tmp map[int][]*metadata
-	tmp = make(map[int][]*metadata,0)
+	bufchan := rb.metaint.metachan
+	var tmp [][]*metadata
+	tmp = make([][]*metadata,rb.parnum,rb.parnum)
 	for i:=0;i<len(rb.metaint.metapoint);i++{
 		index := rb.metaint.metapoint[i].BytesToInt()
 		if tmp[index[2]] == nil{
 			tmp[index[2]] =make([]*metadata,0)
 		}
-		tmp[index[2]] = append(tmp[index[2]], rb.metaint.metapoint[i])
+		tmp[index[2]] = append(tmp[index[2]], &rb.metaint.metapoint[i])
 	}
 	for i:=0;i<int(rb.parnum);i++ {
 		//runtime.GOMAXPROCS(5) // 最多使用2个核
 		//排序chan缓存数量 可以修改
 		rb.wg.Add(1)
 		tpe  := tmp[i]
-		go Quicksort(i,rb.sortcache[i],&tpe,&rb.kvbuffer,&bufchan[i],&rb.wg)
+		go Quicksort(i,tpe,&rb.kvbuffer,&bufchan[i],&rb.wg)
 
 	}
 	rb.wg2.Done()
 	rb.wg.Wait()
 }
+
 func(rb *CacheBuf) WriteOut(content *[]byte){
 	buff := bytes.NewBuffer(rb.kvbuffer)
 	n ,err:= io.ReadFull(buff,*content)

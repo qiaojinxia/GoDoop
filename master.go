@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,41 +22,139 @@ import "net/http"
 //分区结构
 type Partition struct{
 	NReduce int //分区数
-	Url  [][]string //分区存放链接
+	Url  []string //分区存放链接
 }
 func NewPartition(nreduce int) *Partition{
 	p :=  &Partition{
 		NReduce: nreduce,
-		Url:    make([][]string,nreduce),
+		Url:    make([]string,nreduce),
 	}
 	return p
 }
+
+type taskstatus int8
+
+const (
+	TASKTYPE_IDLE = taskstatus(iota) //任务闲置	Master 生成任务时默认状态
+	TASKTYPE_SENDING				//Master -> Worker任务发已发送 未确认
+	TASKTYPE_DELIVERED               //任务已投递	Master -> Worker
+	TASKTYPE_RECYLE                  //任务回收	Master
+
+	TASKTYPE_UNCONFIRM               //Worker 任务未确认 Worker -> Master
+
+	TASKTYPE_PROCESS 			//Worker 已确认未完成 Worker -> Master
+	TASKTYPE_Finished  			//Worker 任务已完成未提交 Worker -> Master
+	TASKTYPE_COMMITED                //Worker 任务已提交 未确认	Worker -> Master
+	TASKTYPE_END                     //Worker Master 已提交 已确认	Worker -> Master
+
+)
 
 //定义任务的结构体
 type Task struct {
 	TaskId          string            //任务id
 	WorksNums       uint64            //任务对应处理的WorksId
 	Files           map[string]string //要处理的任务内容
-	IsFinished      bool              //任务是否完成
 	TaskTYpe        TaskType          //任务类型
 	Partition       *Partition        //分区
+	Ressign	string //记录返回结果的签名
+
+	Status taskstatus //任务状态
+	//如果任务发送过了Worker也会暂时保存这条信息
+	// 如过Master 中途挂掉了 也会把消息返回
+	//直到Master 过渡到下一个版本 或者设置的超时时间
+	TaskSendExpire time.Duration //发送过的消息保留时间
+	ConfireMasterVersion string //Master 版本
+
 	Expiration      int64             //任务的超时时间
-	ConfirmTaskTime time.Duration     //确认收到时间
+	ConfirmTaskTime int64       //确认收到时间
 
 }
 
+//查询是否可以更新状态 或者 更新状态
+func (it *Task) UpdataTaskStaus(stataus taskstatus,updata ...bool) bool{
+	statusstr := strings.Split("TASKTYPE_IDLE,TASKTYPE_SENDING,TASKTYPE_DELIVERED,TASKTYPE_RECYLE,TASKTYPE_UNCONFIRM,TASKTYPE_PROCESS,TASKTYPE_Finished,TASKTYPE_COMMITED,TASKTYPE_END",",")
+	status := make(map[taskstatus][]taskstatus, 0)
+
+	s1 := make([]taskstatus,0)
+	s1 = append(s1, TASKTYPE_SENDING)
+	status[TASKTYPE_IDLE] = s1
+	s2 := make([]taskstatus,0)
+	s2 = append(s2, TASKTYPE_DELIVERED)
+	s2 = append(s2, TASKTYPE_RECYLE)
+	s2 = append(s2, TASKTYPE_IDLE)
+	s2 = append(s2, TASKTYPE_PROCESS)
+	status[TASKTYPE_SENDING] = s2
+	s3 := make([]taskstatus,0)
+	s3 = append(s3, TASKTYPE_RECYLE)
+	s3 = append(s3, TASKTYPE_IDLE)
+	s3 = append(s3, TASKTYPE_Finished)
+	s3 = append(s3, TASKTYPE_UNCONFIRM)
+	s3 = append(s3, TASKTYPE_END)
+	status[TASKTYPE_DELIVERED] = s3
+
+
+	s4 := make([]taskstatus,0)
+	s4 = append(s4, TASKTYPE_PROCESS)
+	status[TASKTYPE_UNCONFIRM] = s4
+
+	s5 := make([]taskstatus,0)
+	s5 = append(s5, TASKTYPE_COMMITED)
+	s5 = append(s5, TASKTYPE_Finished)
+	status[TASKTYPE_PROCESS] = s5
+
+	s6 := make([]taskstatus,0)
+	s6 = append(s6, TASKTYPE_END)
+	status[TASKTYPE_COMMITED] = s6
+
+	s7 := make([]taskstatus,0)
+	s7 = append(s7, TASKTYPE_COMMITED)
+	status[TASKTYPE_Finished] = s7
+
+	//如果提交的 状态 是当前状态的下一个状态
+	if updata[0] == false{
+		for _,v := range status[it.Status]{
+			if v == stataus{
+				Info.Printf("Status %s Can Invert To Status %s",statusstr[it.Status],statusstr[stataus])
+				return true
+			}
+		}
+	}else if  updata[0] == true{
+		for _,v := range status[it.Status]{
+			if v == stataus{
+				Info.Printf("Status %s Can Invert To Status %s",statusstr[it.Status],statusstr[stataus])
+				//更新成下一个状态
+				it.Status = stataus
+				return true
+			}
+		}
+	}
+	Error.Printf("Status %s Can't Invert To Status %s",statusstr[it.Status],statusstr[stataus])
+	return false
+}
+
+//确认超时
+func (it *Task) IsConfirmOutTime() bool{
+	if it.ConfirmTaskTime == 0 {
+		Error.Println("Msg Error!")
+		return true
+	}
+	//如果 当前 时间 大于过期时间 则 过期
+	return time.Now().UnixNano() > it.ConfirmTaskTime
+}
+
 //给定任务id 和 工号 产生出一个Worker
-func NewTask(nreduce int) *Task{
+func NewTask(nreduce int,tstatus taskstatus) *Task{
 	np := NewPartition(nreduce)
 	return &Task{
 		TaskId:    uuid.NewV4().String() ,
 		WorksNums:  0,
 		Files:      make(map[string]string,0),
-		IsFinished: false,
 		TaskTYpe:   0,
 		Partition: np,
 		Expiration: 0,
-		ConfirmTaskTime:time.Duration(time.Now().UnixNano()),
+		ConfirmTaskTime:0,
+		Ressign:"",
+		Status:tstatus,
 	}
 }
 
@@ -66,6 +165,33 @@ func (it Task) Expired() bool{
 	}
 	//如果 当前 时间 大于过期时间 则 过期
 	return time.Now().UnixNano() > it.Expiration
+}
+
+const VERSIONEXPIRTIONTIME  = time.Hour * 2 //2小时内无法完成这批任务全部放弃 
+//控制任务版本 
+type VerionInfo struct {
+	versionid int //版本号
+	versionname string	//版本名
+	expiretime time.Duration//版本过期时间
+	prv *Master //上一个版本
+	next *Master //下一个版本
+}
+
+func NewVersionInfo(versionid int,versionname string) *VerionInfo{
+	a :=  &VerionInfo{
+		versionid:   versionid,
+		versionname: versionname,
+		expiretime:  0,
+	}
+	a.expiretime = time.Duration(time.Now().Add(VERSIONEXPIRTIONTIME).UnixNano())
+	return a
+}
+//版本是否过期
+func (vif VerionInfo) VersionIsExpire() bool{
+	if int64(vif.expiretime) < time.Now().UnixNano(){
+		return true
+	}
+	return false
 }
 
 type Master struct {
@@ -83,18 +209,27 @@ type Master struct {
 	deliverTaskNum int                 //投递出去任务数量
  	expireWork []uint64                //超时Workid
  	exitChan chan bool                 //是否关闭master
- 	Version string                     //master 版本 todo 处理节点故障 每一次 新版本 就会进行一次备份master节点数据
+
+	rwm sync.RWMutex //读写保护锁
+ 	versionInfo VerionInfo              //master 版本 todo 处理节点故障 每一次 新版本 就会进行一次备份master节点数据
+
 }
 
 // Worker 会不断RPC请求 获得要处理的 任务 如果没有获得任务就阻塞 等待任务
 func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
-	m.lock.Lock()         //加锁
+	m.lock.Lock()         //多个线程请求加锁 防止出错
 	defer m.lock.Unlock() //关闭锁
 	//开始处理Woker请求
 	fmt.Printf("Handler Work Request From Work ID : %d !\n", args.WorkNum)
 	//如果Worker是新加入的机器 那么 咱们就给它 分配一个Worker编号
 	if !args.Veify() {
 		reply.Message = "Your Msg Is Expire or Invaild Please Resend It!\n"
+		reply.Invaild()
+		return nil
+	}
+	//如果收到的 消息里已经有任务了 就说明 这条消息不是新建的 为了防止出现一些问题加上验证
+	if len(reply.Tasks) >0 {
+		reply.Message = "【Error】You send a invalid Reply,please ReInit A New Msg!\n"
 		reply.Invaild()
 		return nil
 	}
@@ -117,9 +252,11 @@ func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
 				return nil
 			}
 		}
+
 		//是否验证完成之前的任务后 才能再次得到任务
 		if CANDEBETGETTASK != -1{
-			if len(v.Task)>0{
+			//Worker 最大拥有任务数
+			if len(v.Task) >= OWNTASKNUM {
 				reply.Message = "You Have To Finish The Task You Got Before!\n"
 				reply.Invaild()
 				reply.TaskType = UnfinishedTask //之前任务未完成
@@ -127,21 +264,23 @@ func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
 			}
 		}
 	}
-	//如果收到的 消息里已经有任务了 就说明 这条消息不是新建的 为了防止出现一些问题加上验证
-	if len(reply.Tasks) >0 {
-		reply.Message = "【Error】You send a invalid Reply,please ReInit A New Msg!\n"
-		reply.Invaild()
-		return nil
-	}
 	//循环从channel取 MapReduce任务
 	for {
 		select {
+		//从管道中 取任务
 		case mt := <-m.MapTaskList:
-			//给任务绑定员WorkNum
+			//对 已经生成的任务 进行 分配前的准备
 			mt.WorksNums = args.WorkNum
+			err := mt.UpdataTaskStaus(TASKTYPE_SENDING,true)
+			//如果任务状态无法转换
+			if err == false {
+				panic("error")
+			}
 			mt.Expiration = time.Now().Add(time.Second * TASKTIMEOUT).UnixNano() //设置Task过期时间
-			mt.TaskTYpe = MapTask                                                //设置task类型
-			reply.Tasks = append(reply.Tasks, *mt)                               //给rpc返回
+			mt.TaskTYpe = MapTask //设置task类型
+			mt.ConfirmTaskTime = time.Now().Add(time.Second * CONFIRMOUTTIME).UnixNano()//设置确认超时时间
+			//---------------
+			reply.Tasks = append(reply.Tasks, *mt)  //给rpc返回
 			//谁先抢到归谁 模式
 			//将分配 出去的task存放在 work表里
 			worktable, ok := m.worktable[args.WorkNum]
@@ -149,7 +288,7 @@ func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
 			m.worktable[args.WorkNum] = worktable
 			if MASTERDISTRIBUTIONMODEL == AVGDISTRIBUTION {
 				if !ok {
-					fmt.Println("【ERROR】Cannot Find WrkoInfo From Table!")
+					Error.Printf("Cannot Find WrkoInfo WorkNum %d From Table!",args.WorkNum)
 				}
 				reply.TaskType = MapTask
 				goto end
@@ -172,27 +311,28 @@ func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
 				//通过计算 每台计算机时间 处理返回时 和文件大小算出算力 按照 算力 * 文件总数 来动态的根据性能分配
 				fmt.Println("todo")
 			}
-		case rt := <-m.ReduceTaskList:
-			//Todo 按照规则指定Reduce生成的文件名字
-			rt.TaskTYpe = ReduceTask
-			rt.Expiration = time.Now().Add(time.Second * 60).UnixNano() //设置Task过期时间
-			reply.Tasks = append(reply.Tasks, *rt)                      //给rpc返回
-			reply.IsValid = true                                        //设置消息状态为true
-			//将发出去的任务存储起来
-			worktable, ok := m.worktable[args.WorkNum]
-			if !ok {
-				fmt.Println("【ERROR】Cannot Find WrkoInfo From Table!")
-				return nil
-			}
-			worktable.Task[rt.TaskId] = *rt
-			m.worktable[args.WorkNum] = worktable
-			reply.TaskType = ReduceTask
-			goto end
+		//case rt := <-m.ReduceTaskList:
+		//	//Todo 按照规则指定Reduce生成的文件名字
+		//	rt.TaskTYpe = ReduceTask
+		//	rt.UpdataTaskStaus(TASKTYPE_SENDING,false)
+		//	rt.Expiration = time.Now().Add(time.Second * 60).UnixNano() //设置Task过期时间
+		//	reply.Tasks = append(reply.Tasks, *rt)                      //给rpc返回
+		//	reply.IsValid = true                                        //设置消息状态为true
+		//	//将发出去的任务存储起来
+		//	worktable, ok := m.worktable[args.WorkNum]
+		//	if !ok {
+		//		fmt.Println("【ERROR】Cannot Find WrkoInfo From Table!")
+		//		return nil
+		//	}
+		//	worktable.Task[rt.TaskId] = *rt
+		//	m.worktable[args.WorkNum] = worktable
+		//	reply.TaskType = ReduceTask
+		//	goto end
 		default:
 			//如果没有任务了
 			if len(m.MapTaskList) == 0{
 				//如果获取不到返回
-				reply.Message = "No Task Get!\n"
+				reply.Message = "Now Has No Task In Master!\n"
 				reply.TaskType = NoneTask
 				reply.Sign()
 				return nil
@@ -203,8 +343,6 @@ func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
 	tasktype := "MapTask"
 	if reply.TaskType == ReduceTask {
 		tasktype ="ReduceTask"
-	}else{
-		fmt.Println("map handler。。。 todo")
 	}
 	reply.Sign()
 	taskids:="["
@@ -226,6 +364,7 @@ func (m *Master) GetTask(args Msg_Args, reply *Msg_Reply) error {
 func(m *Master) delivertaskscan() {
 		for {
 			//遍历Work表
+			m.rwm.Lock()
 			for _, work := range m.worktable {
 				for i, task := range work.Task {
 					//如果Worker过期了 把全部的任务 放回
@@ -234,83 +373,62 @@ func(m *Master) delivertaskscan() {
 						case MapTask:
 							task.WorksNums = 0
 							x := work.Task[i]
+							up := x.UpdataTaskStaus(TASKTYPE_RECYLE,true)
+							if up == false{
+								continue
+							}
 							m.MapTaskList <- &x
 							//从map中删除
 							delete(work.Task, i)
-							fmt.Printf("recycle task %s\n",task.TaskId )
+							fmt.Printf("Recycle TaskResult %s\n",task.TaskId )
 						case ReduceTask:
 							task.WorksNums = 0
 							x := work.Task[i]
+							up := x.UpdataTaskStaus(TASKTYPE_RECYLE,true)
+							if up == false{
+								continue
+							}
 							m.MapTaskList <- &x
 							//从map中删除
 							delete(work.Task, i)
-							fmt.Printf("recycle task %s\n",task.TaskId )
+							Info.Printf("Recycle TaskResult %s\n",task.TaskId )
 						}
-					} else if task.Expired() {
-						switch task.TaskTYpe {
-						case MapTask:
-							task.WorksNums = 0
-							m.MapTaskList <- &task
-							//从map中删除
-							delete(work.Task, i)
-							fmt.Printf("recycle task %s\n",task.TaskId )
-						case ReduceTask:
-							task.WorksNums = 0
-							m.ReduceTaskList <- &task
-							//从map中删除
-							delete(work.Task, i)
-							fmt.Printf("recycle task %s\n",task.TaskId )
+						//任务 过期或者任务超时 回收任务
+					} else if task.Expired() || task.IsConfirmOutTime() {
+						//完成的任务不需要维护
+						if task.Status != TASKTYPE_END {
+							switch task.TaskTYpe {
+							case MapTask:
+								task.WorksNums = 0
+								up := task.UpdataTaskStaus(TASKTYPE_RECYLE,true)
+								if up == false{
+									continue
+								}
+								m.MapTaskList <- &task
+								//从map中删除
+								delete(work.Task, i)
+								fmt.Printf("recycle TaskResult %s\n",task.TaskId )
+							case ReduceTask:
+								task.WorksNums = 0
+								up := task.UpdataTaskStaus(TASKTYPE_RECYLE,true)
+								if up == false{
+									continue
+								}
+								m.ReduceTaskList <- &task
+								//从map中删除
+								delete(work.Task, i)
+								fmt.Printf("recycle TaskResult %s\n",task.TaskId )
+							}
 						}
 					}
 				}
 
 			}
+			m.rwm.Unlock()
 			//扫描间隔
 			time.Sleep(time.Second * 1)
 		}
 }
-
-////从维护的 已投递任务中遍历 如果 taskid 和对应的 work匹配
-////也就是说 如果 有个任务超时了 那么他的task 就分配给别人了
-////那么就验证失败了
-//func(m *Master) validTask(worknum uint64,taskid string) (bool,int){
-//	for i,m := range m.DeliverTasks{
-//		//如果任务id 和 workid 跟本地的投递任务表匹配
-//		if m.TaskId == taskid && worknum == m.WorksNums {
-//			//如果超时了 扔掉这条消息
-//			if m.Expired() {
-//				return false,-1
-//			}
-//			//返回 true 和索引
-//			return true,i
-//		}
-//	}
-//	return false,-1
-//}
-//
-////任务完成时 Work 通过RPC调用 将任务ID告知
-//func (m *Master) WorkeDoneInvock(args Msg_Args, reply *Msg_Reply) error {
-//	fmt.Printf("Worker %d Finished reply Task args %s " ,args.WorkNum,args.TaskId)
-//	//如果校验成功
-//	if ok,index := m.validTask(args.WorkNum,args.TaskId);ok {
-//		//判断要处理的任务类型
-//		switch m.DeliverTasks[index].TaskTYpe  {
-//			//处理完的Map任务
-//			case MapTask:
-//				//拿到值
-//				val := m.DeliverTasks[index]
-//				//从投递表中删除
-//				m.DeliverTasks[index] = nil
-//				//Map任务完成后扔到Reduce表
-//				m.ReduceTaskList <- val
-//			case ReduceTask:
-//				//工作完成 设置为true
-//				m.DeliverTasks[index].IsFinished = true
-//		}
-//	}
-//	return nil
-//}
-
 
 //分割文件  按照每个文件不在超过一定的大小 比如 1M
 func (m *Master) splitFiles(){
@@ -319,6 +437,49 @@ func (m *Master) splitFiles(){
 			m.splitFile(fl,m.SplitsSize)
 		}
 		fmt.Println("Split Files Finished!")
+}
+//生成Reduce任务
+func (m *Master)GenerateReduce(){
+	for{
+		time.Sleep(time.Second * 1)
+		var worklfinished map[string]Task
+		ts := NewTask(m.nREduce,TASKTYPE_IDLE)
+		//遍历work表找到 Map类型的 并且已经完成的任务
+		taskcontent := make(map[string]string,0)
+		for i,wk := range m.worktable{
+			for _,tsk := range wk.Task{
+				if tsk.Status == TASKTYPE_END && tsk.TaskTYpe == MapTask{
+					if len(wk.FinishedTask) == 0{
+						worklfinished = make(map[string]Task,0)
+					}else{
+						worklfinished = wk.FinishedTask
+					}
+					worklfinished[tsk.TaskId] = tsk
+
+				}
+				delete(wk.Task,tsk.TaskId)
+			}
+			if worklfinished != nil{
+				wk.FinishedTask = worklfinished
+				m.worktable[i] = wk
+			}
+		}
+		for i:=0;i<m.nREduce;i++{
+			for i,wk := range m.worktable{
+				for _,ftsk := range wk.FinishedTask{
+					//存储的url 为本地 todo 后期改成服务器地址
+					taskcontent[ftsk.Partition.Url[i]]=ftsk.Partition.Url[i]
+				}
+
+			}
+		}
+		if len(taskcontent) > 0 {
+			ts.Files = taskcontent
+			m.ReduceTaskList <- ts
+		}
+	}
+
+///endXXXXXXXXXXXXXXXXXXXX
 }
 
 //生成待分配的任务
@@ -336,10 +497,9 @@ func (m *Master) generateTask(){
 			num ++//计次
 			//todo 可以存储url suchas ["cat.txt":"wwww.baidu.com/cat.txt"]
 			tmp[m] = m
-			fmt.Println(m,num,"tmplen",len(tmp))
 			if num  == nMapLen {
 				//新建一个任务
-				ts := NewTask(nReduce)
+				ts := NewTask(nReduce,TASKTYPE_IDLE)
 				for k,_ := range tmp {
 					//将待处理的files 添加进 Tasks
 					ts.Files [k] = k
@@ -416,6 +576,7 @@ func (m *Master) Server() {
 	go m.delivertaskscan()//维护已经分配出去的任务
 	go m.sacnExpireWork()
 	go m.showInfo()
+	go m.GenerateReduce()
 	rpc.Register(m)
 	rpc.HandleHTTP()
 	l, e := net.Listen("tcp", ":1234")
@@ -432,12 +593,14 @@ func (m *Master) Server() {
 func (m *Master) sacnExpireWork(){
 	for{
 		select {
+
 		case isexit :=<- m.exitChan:
 			m.exitChan <- isexit
 			if isexit{
 				goto scanend
 			}
 		default:
+			m.rwm.Lock()
 			newlist:= make([]uint64,0)
 			for id,wk := range m.worktable{
 				//如果Worker 过期了 那就加入过期表
@@ -450,6 +613,7 @@ func (m *Master) sacnExpireWork(){
 				if workid == 0{
 					continue
 				}
+
 				//如果找到了 这个过期的WorkInfo
 				if work,ok := m.worktable[workid];ok{
 					if !work.isExpire(){
@@ -462,6 +626,7 @@ func (m *Master) sacnExpireWork(){
 						delete(m.worktable,workid)
 					}
 				}
+				m.rwm.Unlock()
 				tmplist := make([]uint64,0)
 				for _,workid := range newlist {
 					if workid == 0 {
@@ -488,25 +653,42 @@ func (m *Master) showInfo() {
 				}
 		default:
 			DeliverTaskNum := 0
+			mapFinished := 0
+			reduceFinished := 0
+			sendingtask := 0
 			//遍历所有 worker节点
 			for _,work := range m.worktable{
-				//过期的Worker不加入计算
-				if work.isExpire(){
-					continue
+				//遍历work 任务表
+				for _,task := range work.Task{
+					//过期的WOrker 未完成的不计算在内
+					if work.isExpire() {
+						break
+					}
+					if !task.Expired() && task.Status == TASKTYPE_DELIVERED {
+						DeliverTaskNum ++
+					}
+					if !task.Expired() && task.Status == TASKTYPE_SENDING {
+						sendingtask ++
+					}
 				}
-					//遍历work 里面的task 如果task没过期 计数 +1
-					for _,task := range work.Task{
-						if !task.Expired(){
-							DeliverTaskNum ++
+					//遍历work 里面的完成任务列表
+				for _,task := range work.FinishedTask{
+					if task.Status == TASKTYPE_END {
+						if task.TaskTYpe == MapTask{
+							//生成Reduce任务
+							mapFinished += 1
+						}else if task.TaskTYpe == ReduceTask{
+							reduceFinished +=1
 						}
 					}
+				}
 
 			}
 			m.deliverTaskNum = DeliverTaskNum
-			fmt.Printf("【INFO】Now Online Work Num : %d ,MapTask Num : %d ,Reduce Task Num : %d, OffLine Work Num : %d DeliverTaskNum: %d \n",
-				len(m.worktable)-len(m.expireWork),len(m.MapTaskList),len(m.ReduceTaskList),len(m.expireWork),m.deliverTaskNum)
+			fmt.Printf("【INFO】Now Online Work Num : %d ,MapTask Num : %d ,Reduce Task Num : %d, " +
+				"OffLine Work Num : %d DeliverTaskNum: %d SendingTaskNum: %d  MapFinished: %d ReduceFinished: %d \n",
+				len(m.worktable)-len(m.expireWork),len(m.MapTaskList),len(m.ReduceTaskList),len(m.expireWork),m.deliverTaskNum,sendingtask,mapFinished,reduceFinished)
 			time.Sleep(time.Second * 2)
-
 		}
 	}
 	infoend:
@@ -533,6 +715,7 @@ func (m *Master) RegisterWorker(args Msg_Regs,reply *Reply_Regs) error{
 
 //监听心跳
 func (m *Master) HeartMonitor(args Msg_Heart,reply *Reply_Heart) error{
+	//加锁
 	if args.IsValid && !args.isExpire(){
 		if _, ok := m.worktable[args.WorkId];ok{
 			workinfo := m.worktable[args.WorkId]
@@ -542,6 +725,67 @@ func (m *Master) HeartMonitor(args Msg_Heart,reply *Reply_Heart) error{
 			workinfo.HeartNum += 1
 			m.worktable[args.WorkId] = workinfo
 			info := workinfo.ToString()
+			//如果心跳中包含 节点收到Task的确认消息
+			if args.hasTaskInfo(){
+				rtinfo := make([]string,0,len(args.ConfimTaskID))
+				for i:=0;i<len(args.ConfimTaskID);i++{
+					taskid := args.ConfimTaskID[i]
+					//校验 当前Work的这个任务是否存在 存在的进行 记录
+					task,ok :=  m.worktable[args.WorkId].Task[taskid]
+					if !ok{
+						continue
+					}
+					//改为已确认投递状态
+					up := task.UpdataTaskStaus(TASKTYPE_DELIVERED,true)
+					if up == false{
+						continue
+					}
+					//如果能在本地表里找到 设置确认时间 然后确认给Worker
+					rtinfo = append(rtinfo, args.ConfimTaskID[i])
+					//收到确认消息
+					task.ConfirmTaskTime = time.Now().Add(time.Hour * 9999).UnixNano()
+					//设置返回的消息
+					reply.AckConfirm = rtinfo
+					m.worktable[args.WorkId].Task[taskid] = task
+				}
+			}
+			//如果心跳中包含 完成的任务
+			if args.hasTaskFinished(){
+				for i:=0;i<len(args.TaskResult);i++{
+					//在本地表中找到task
+					taskid := args.TaskResult[i].TaskId
+					task,ok :=  m.worktable[args.WorkId].Task[taskid]
+					if !ok{
+						continue
+					}
+					//确认任务任务没有过期
+					if task.Expired() != true{
+						fin := make([]string,0,len(args.TaskResult))
+
+						//验证 worid 与 本地信息相符
+						if task.WorksNums == args.WorkId && task.TaskTYpe == args.TaskResult[i].TaskType {
+							//把 收到的url信息 全部记录到本地
+								if args.TaskResult[i].getSign() == args.TaskResult[i].sign || task.Ressign == args.TaskResult[i].sign{
+									Info.Printf("收到了完成的任务 %v",args.TaskResult[i].PathUrl)
+									//将本地的par修改成 Worker的 包含了 文件的地址
+									task.Partition= &args.TaskResult[i].PathUrl
+									//改为任务已完成状态
+									up := task.UpdataTaskStaus(TASKTYPE_END,true)
+									if up == false{
+										continue
+									}
+									m.worktable[args.WorkId].Task[taskid] = task
+									//将任务id放进去人列表
+									fin = append(fin, task.TaskId)
+
+								}else{
+									Info.Println("Message sign is invalid or this Message has deliver!")
+								}
+						}
+					}
+				}
+			}
+			
 			fmt.Printf("Work Id %d Send Heart  Update Workinfo Now Is %s \n",args.WorkId,info)
 			reply.Sign()
 		}else{
